@@ -30,6 +30,7 @@
 #include <cupsfilters/libcups2-private.h>
 #include <cups/pwg.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 //
 // Local functions
@@ -538,9 +539,17 @@ cfRasterPrepareHeader(cups_page_header_t *h,   // I  - Raster header
       h->cupsImagingBBox[i] = 0.0;
       h->ImagingBoundingBox[i] = 0;
     }
-  h->cupsBytesPerLine = (h->cupsBitsPerPixel * h->cupsWidth + 7) / 8;
+  uint64_t bpl = ((uint64_t)h->cupsBitsPerPixel * h->cupsWidth + 7) / 8;
   if (h->cupsColorOrder == CUPS_ORDER_BANDED)
-    h->cupsBytesPerLine *= h->cupsNumColors;
+    bpl *= h->cupsNumColors;
+  if (bpl > UINT32_MAX)
+  {
+    if (log) log(ld, CF_LOGLEVEL_ERROR,
+		 "cfRasterPrepareHeader: Invalid raster dimensions/color depth (overflow).");
+    cupsFreeOptions(num_options, options);
+    return (-1);
+  }
+  h->cupsBytesPerLine = (unsigned int)bpl;
 
   // Mark header as PWG Raster if it is not CUPS Raster
   if (!cupsrasterheader)
@@ -807,7 +816,10 @@ cfRasterSetColorSpace(cups_page_header_t *h,   // I  - Raster header
   h->cupsBitsPerPixel = best_depth * num_colors;
   h->cupsColorSpace = *cspace;
   h->cupsNumColors = num_colors;
-  h->cupsBytesPerLine = (h->cupsWidth * h->cupsBitsPerPixel + 7) / 8;
+  uint64_t bpl = ((uint64_t)h->cupsWidth * h->cupsBitsPerPixel + 7) / 8;
+  if (bpl > UINT32_MAX)
+    return (-1);
+  h->cupsBytesPerLine = (unsigned int)bpl;
 
   return (0);
 }
