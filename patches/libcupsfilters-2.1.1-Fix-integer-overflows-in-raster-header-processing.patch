@@ -1,0 +1,274 @@
+From f51ec3fdf2e6a59c764e92dd2b83012f18605c56 Mon Sep 17 00:00:00 2001
+From: Nathan Muggli <nmuggli@google.com>
+Date: Wed, 10 Jun 2026 17:39:37 -0600
+Subject: [PATCH] Fix integer overflows in raster header processing
+
+Add overflow checks when calculating cupsBytesPerLine and other buffer
+sizes. These calculations could overflow 32-bit integers, leading to
+undersized buffer allocations and subsequent heap out-of-bounds writes
+when processing crafted raster streams.
+
+Bug: 511821731
+Test: Ensure printing still works using pwgtoraster filter
+Flags: EXEMPT BUGFIX
+Change-Id: I1901738698979c964f89f244cfe8f6be0ebf501f
+---
+ cupsfilters/imagetoraster.c | 25 ++++++++--
+ cupsfilters/pwgtoraster.c   | 98 +++++++++++++++++++++++++++++++------
+ cupsfilters/raster.c        | 18 +++++--
+ 3 files changed, 118 insertions(+), 23 deletions(-)
+
+diff --git a/cupsfilters/imagetoraster.c b/cupsfilters/imagetoraster.c
+index e22958623..2c190ee42 100644
+--- a/cupsfilters/imagetoraster.c
++++ b/cupsfilters/imagetoraster.c
+@@ -29,6 +29,7 @@
+ //
+ 
+ #include <cupsfilters/filter.h>
++#include <stdint.h>
+ #include <cupsfilters/raster.h>
+ #include <cupsfilters/colormanager.h>
+ #include <cupsfilters/ipp.h>
+@@ -1352,11 +1353,17 @@ cfFilterImageToRaster(int inputfd,         // I - File descriptor input stream
+     header.cupsHeight = (doc.Orientation & 1 ? xprint : yprint) *
+       header.HWResolution[1];
+   }
+-  header.cupsBytesPerLine = (header.cupsBitsPerPixel *
+-			     header.cupsWidth + 7) / 8;
+-
++  uint64_t bpl = ((uint64_t)header.cupsBitsPerPixel * header.cupsWidth + 7) / 8;
+   if (header.cupsColorOrder == CUPS_ORDER_BANDED)
+-    header.cupsBytesPerLine *= header.cupsNumColors;
++    bpl *= header.cupsNumColors;
++  if (bpl > UINT32_MAX)
++  {
++    if (log) log(ld, CF_LOGLEVEL_ERROR,
++		 "cfFilterImageToRaster: Invalid raster dimensions/color depth (overflow).");
++    cfImageClose(img);
++    return (1);
++  }
++  header.cupsBytesPerLine = (unsigned int)bpl;
+ 
+   header.Margins[0] = doc.PageLeft;
+   header.Margins[1] = doc.PageBottom;
+@@ -1629,7 +1636,15 @@ cfFilterImageToRaster(int inputfd,         // I - File descriptor input stream
+ 	"cfFilterImageToRaster: img->colorspace = %d", img->colorspace);
+   }
+ 
+-  row = malloc(2 * header.cupsBytesPerLine);
++  uint64_t row_size = 2ULL * header.cupsBytesPerLine;
++  if (row_size > UINT32_MAX)
++  {
++    if (log) log(ld, CF_LOGLEVEL_ERROR,
++		 "cfFilterImageToRaster: Row buffer size too large (overflow).");
++    cfImageClose(img);
++    return (1);
++  }
++  row = malloc((size_t)row_size);
+   ras = cupsRasterOpen(outputfd, CUPS_RASTER_WRITE);
+ 
+   for (i = 0, page = 1; i < doc.Copies; i ++)
+diff --git a/cupsfilters/pwgtoraster.c b/cupsfilters/pwgtoraster.c
+index ee81000de..f1006d39b 100644
+--- a/cupsfilters/pwgtoraster.c
++++ b/cupsfilters/pwgtoraster.c
+@@ -25,6 +25,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <stdbool.h>
++#include <stdint.h>
+ #include <string.h>
+ #include <stdarg.h>
+ #include <cups/cups.h>
+@@ -1292,7 +1293,7 @@ out_page(pwgtoraster_doc_t *doc,
+ 	 cups_raster_t *outras,
+ 	 conversion_function_t *convert)
+ {
+-  int i, j;
++  uint64_t i, j;
+   cf_filter_data_t *data = doc->data;
+   float paperdimensions[2], // Physical size of the paper
+     margins[4];	// Physical margins of print
+@@ -1475,11 +1476,27 @@ out_page(pwgtoraster_doc_t *doc,
+ 	(unsigned int)(doc->outheader.cupsImagingBBox[i] + 0.5);
+   }
+ 
+-  doc->bytesPerLine = doc->outheader.cupsBytesPerLine =
+-    (doc->outheader.cupsBitsPerPixel *
+-     doc->outheader.cupsWidth + 7) / 8;
++  uint64_t bpl = ((uint64_t)doc->outheader.cupsBitsPerPixel *
++		  doc->outheader.cupsWidth + 7) / 8;
++  if (bpl > UINT32_MAX)
++  {
++    if (log) log(ld, CF_LOGLEVEL_ERROR,
++		 "cfFilterPWGToRaster: Invalid raster dimensions (overflow).");
++    ret = false;
++    goto out;
++  }
++  doc->bytesPerLine = (unsigned int)bpl;
++
+   if (doc->outheader.cupsColorOrder == CUPS_ORDER_BANDED)
+-    doc->outheader.cupsBytesPerLine *= doc->outheader.cupsNumColors;
++    bpl *= doc->outheader.cupsNumColors;
++  if (bpl > UINT32_MAX)
++  {
++    if (log) log(ld, CF_LOGLEVEL_ERROR,
++		 "cfFilterPWGToRaster: Invalid raster dimensions/color depth (overflow).");
++    ret = false;
++    goto out;
++  }
++  doc->outheader.cupsBytesPerLine = (unsigned int)bpl;
+ 
+   if (!cupsRasterWriteHeader(outras, &(doc->outheader)))
+   {
+@@ -1663,8 +1680,24 @@ out_page(pwgtoraster_doc_t *doc,
+   if (doc->inheader.cupsNumColors == 3)
+   {
+     input_color_mode = 2;
+-    inlineoffset = doc->bitmapoffset[0] * 3;
+-    inlinesize = doc->outheader.cupsWidth * 3;
++
++    uint64_t temp_inlineoffset = (uint64_t)doc->bitmapoffset[0] * 3;
++    if (temp_inlineoffset > UINT32_MAX)
++    {
++      if (log) log(ld, CF_LOGLEVEL_ERROR,
++		   "cfFilterPWGToRaster: Invalid raster offset (overflow).");
++      return (false);
++    }
++    inlineoffset = (unsigned int)temp_inlineoffset;
++
++    uint64_t temp_inlinesize = (uint64_t)doc->outheader.cupsWidth * 3;
++    if (temp_inlinesize > UINT32_MAX)
++    {
++      if (log) log(ld, CF_LOGLEVEL_ERROR,
++		   "cfFilterPWGToRaster: Invalid raster width (overflow).");
++      return (false);
++    }
++    inlinesize = (unsigned int)temp_inlinesize;
+   }
+   else if (doc->inheader.cupsNumColors == 1 &&
+ 	   doc->inheader.cupsBitsPerColor == 8)
+@@ -1753,24 +1786,50 @@ out_page(pwgtoraster_doc_t *doc,
+   // enough space.
+   //
+ 
+-  i = doc->inheader.cupsBytesPerLine * res_up_factor[0];
+-  j = inlineoffset + inlinesize;
++  i = (uint64_t)doc->inheader.cupsBytesPerLine * res_up_factor[0];
++  j = (uint64_t)inlineoffset + inlinesize;
+   if (j > i)
+     i = j;
+-  line =
+-    (unsigned char *)calloc(i, sizeof(unsigned char));
++  if (i > UINT32_MAX)
++  {
++    if (log) log(ld, CF_LOGLEVEL_ERROR,
++		 "cfFilterPWGToRaster: Input line buffer size too large (overflow).");
++    ret = false;
++    goto out;
++  }
++  line = (unsigned char *)calloc((size_t)i, sizeof(unsigned char));
+ 
+   // Input line averaging buffer (to reduce resolution)
+   if (res_down_factor[1] > 1 && input_color_mode > 0)
++  {
++    uint64_t temp_lineavg_size = (uint64_t)doc->inheader.cupsBytesPerLine *
++				 res_down_factor[1];
++    if (temp_lineavg_size > UINT32_MAX)
++    {
++      if (log) log(ld, CF_LOGLEVEL_ERROR,
++		   "cfFilterPWGToRaster: Line averaging buffer size too large (overflow).");
++      ret = false;
++      goto out;
++    }
+     lineavg =
+-      (unsigned char *)calloc(doc->inheader.cupsBytesPerLine *
+-			      res_down_factor[1],
++      (unsigned char *)calloc((size_t)temp_lineavg_size,
+ 			      sizeof(unsigned char));
++  }
+ 
+   // Input page buffer for color ordered in planes (if needed)
+   if (doc->nplanes > 1)
+-    pagebuf = (unsigned char *)calloc(doc->outheader.cupsHeight * inlinesize,
++  {
++    uint64_t temp_pagebuf_size = (uint64_t)doc->outheader.cupsHeight * inlinesize;
++    if (temp_pagebuf_size > UINT32_MAX)
++    {
++      if (log) log(ld, CF_LOGLEVEL_ERROR,
++		   "cfFilterPWGToRaster: Page buffer size too large (overflow).");
++      ret = false;
++      goto out;
++    }
++    pagebuf = (unsigned char *)calloc((size_t)temp_pagebuf_size,
+ 				      sizeof(unsigned char));
++  }
+ 
+   //
+   // Overspray stretch of the input image If the output page
+@@ -2189,7 +2248,16 @@ out_page(pwgtoraster_doc_t *doc,
+ 	// We are always on color mode 1 (8-bit gray) at this point
+ 	if (color_mode_needed == 2) // 8-bit RGB
+ 	{
+-	  preBuf2 = (unsigned char *)calloc(doc->outheader.cupsWidth * 3,
++    uint64_t temp_preBuf2_size = (uint64_t)doc->outheader.cupsWidth * 3;
++    if (temp_preBuf2_size > UINT32_MAX)
++    {
++      if (log) log(ld, CF_LOGLEVEL_ERROR,
++		   "cfFilterPWGToRaster: preBuf2 size too large (overflow).");
++      ret = false;
++      free(preBuf1);
++      goto out;
++    }
++	  preBuf2 = (unsigned char *)calloc((size_t)temp_preBuf2_size,
+ 					    sizeof(unsigned char));
+ 	  cfImageWhiteToRGB(bp, preBuf2, doc->outheader.cupsWidth);
+ 	  bp = preBuf2;
+diff --git a/cupsfilters/raster.c b/cupsfilters/raster.c
+index 528de7dda..968c80bd5 100644
+--- a/cupsfilters/raster.c
++++ b/cupsfilters/raster.c
+@@ -30,6 +30,7 @@
+ #include <cupsfilters/libcups2-private.h>
+ #include <cups/pwg.h>
+ #include <stdbool.h>
++#include <stdint.h>
+ 
+ //
+ // Local functions
+@@ -538,9 +539,17 @@ cfRasterPrepareHeader(cups_page_header_t *h,   // I  - Raster header
+       h->cupsImagingBBox[i] = 0.0;
+       h->ImagingBoundingBox[i] = 0;
+     }
+-  h->cupsBytesPerLine = (h->cupsBitsPerPixel * h->cupsWidth + 7) / 8;
++  uint64_t bpl = ((uint64_t)h->cupsBitsPerPixel * h->cupsWidth + 7) / 8;
+   if (h->cupsColorOrder == CUPS_ORDER_BANDED)
+-    h->cupsBytesPerLine *= h->cupsNumColors;
++    bpl *= h->cupsNumColors;
++  if (bpl > UINT32_MAX)
++  {
++    if (log) log(ld, CF_LOGLEVEL_ERROR,
++		 "cfRasterPrepareHeader: Invalid raster dimensions/color depth (overflow).");
++    cupsFreeOptions(num_options, options);
++    return (-1);
++  }
++  h->cupsBytesPerLine = (unsigned int)bpl;
+ 
+   // Mark header as PWG Raster if it is not CUPS Raster
+   if (!cupsrasterheader)
+@@ -807,7 +816,10 @@ cfRasterSetColorSpace(cups_page_header_t *h,   // I  - Raster header
+   h->cupsBitsPerPixel = best_depth * num_colors;
+   h->cupsColorSpace = *cspace;
+   h->cupsNumColors = num_colors;
+-  h->cupsBytesPerLine = (h->cupsWidth * h->cupsBitsPerPixel + 7) / 8;
++  uint64_t bpl = ((uint64_t)h->cupsWidth * h->cupsBitsPerPixel + 7) / 8;
++  if (bpl > UINT32_MAX)
++    return (-1);
++  h->cupsBytesPerLine = (unsigned int)bpl;
+ 
+   return (0);
+ }
+-- 
+2.54.0.1099.g489fc7bff1-goog
+

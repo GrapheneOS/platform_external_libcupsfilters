@@ -29,6 +29,7 @@
 //
 
 #include <cupsfilters/filter.h>
+#include <stdint.h>
 #include <cupsfilters/raster.h>
 #include <cupsfilters/colormanager.h>
 #include <cupsfilters/ipp.h>
@@ -1352,11 +1353,17 @@ cfFilterImageToRaster(int inputfd,         // I - File descriptor input stream
     header.cupsHeight = (doc.Orientation & 1 ? xprint : yprint) *
       header.HWResolution[1];
   }
-  header.cupsBytesPerLine = (header.cupsBitsPerPixel *
-			     header.cupsWidth + 7) / 8;
-
+  uint64_t bpl = ((uint64_t)header.cupsBitsPerPixel * header.cupsWidth + 7) / 8;
   if (header.cupsColorOrder == CUPS_ORDER_BANDED)
-    header.cupsBytesPerLine *= header.cupsNumColors;
+    bpl *= header.cupsNumColors;
+  if (bpl > UINT32_MAX)
+  {
+    if (log) log(ld, CF_LOGLEVEL_ERROR,
+		 "cfFilterImageToRaster: Invalid raster dimensions/color depth (overflow).");
+    cfImageClose(img);
+    return (1);
+  }
+  header.cupsBytesPerLine = (unsigned int)bpl;
 
   header.Margins[0] = doc.PageLeft;
   header.Margins[1] = doc.PageBottom;
@@ -1629,7 +1636,15 @@ cfFilterImageToRaster(int inputfd,         // I - File descriptor input stream
 	"cfFilterImageToRaster: img->colorspace = %d", img->colorspace);
   }
 
-  row = malloc(2 * header.cupsBytesPerLine);
+  uint64_t row_size = 2ULL * header.cupsBytesPerLine;
+  if (row_size > UINT32_MAX)
+  {
+    if (log) log(ld, CF_LOGLEVEL_ERROR,
+		 "cfFilterImageToRaster: Row buffer size too large (overflow).");
+    cfImageClose(img);
+    return (1);
+  }
+  row = malloc((size_t)row_size);
   ras = cupsRasterOpen(outputfd, CUPS_RASTER_WRITE);
 
   for (i = 0, page = 1; i < doc.Copies; i ++)
